@@ -4,11 +4,15 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bwtaln.h"
 #include "kvec.h"
 #include "bntseq.h"
 #include "utils.h"
 #include "stdaln.h"
+#include "goby.h"
 
 typedef struct {
 	int n;
@@ -642,6 +646,29 @@ ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, 
 	return pacseq;
 }
 
+static void destroy(CAlignmentsWriterHelper *writerHelper, int tot_seqs, bntseq_t *bns,
+		bntseq_t *ntbns, bwa_seqio_t **ks, FILE **fp_sa, uint8_t *pac, bwt_t **bwt) {
+	int i;
+	khint_t iter;
+#ifdef HAVE_GOBY
+	if (writerHelper) {
+	    gobyAlignments_finished(writerHelper, tot_seqs);
+	}
+#endif
+	bns_destroy(bns);
+	if (ntbns) bns_destroy(ntbns);
+	for (i = 0; i < 2; ++i) {
+		bwa_seq_close(ks[i]);
+		fclose(fp_sa[i]);
+	}
+	for (iter = kh_begin(g_hash); iter != kh_end(g_hash); ++iter)
+		if (kh_exist(g_hash, iter)) free(kh_val(g_hash, iter).a);
+	kh_destroy(64, g_hash);
+	if (pac) {
+		free(pac); bwt_destroy(bwt[0]); bwt_destroy(bwt[1]);
+	}
+}
+
 void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const fn_fa[2], pe_opt_t *popt)
 {
 	extern bwa_seqio_t *bwa_open_reads(int mode, const char *fn_fa);
@@ -652,28 +679,62 @@ void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const f
 	bntseq_t *bns, *ntbns = 0;
 	FILE *fp_sa[2];
 	gap_opt_t opt, opt0;
-	khint_t iter;
 	isize_info_t last_ii; // this is for the last batch of reads
 	char str[1024];
 	bwt_t *bwt[2];
 	uint8_t *pac;
 
 	// initialization
+	CAlignmentsWriterHelper *writerHelper = NULL;
+#ifdef HAVE_GOBY
+	if (goby_config->output_format == OUTPUT_FORMAT_GOBY) {
+		gobyAlignments_openAlignmentsWriterDefaultEntriesPerChunk(
+			goby_config->output_basename, &writerHelper);
+		/* Convert from Illumina back to Phred when writing Goby Comapct-Alignments. */
+		gobyAlignments_setQualityAdjustment(writerHelper, -64);
+        gobyAlignments_setQueryIndexOccurrencesStoredInEntries(writerHelper, 1);
+	}
+	goby_config->num_input_files = 2;
+	goby_config->num_creads_files = 0;
+#endif
 	bwase_initialize(); // initialize g_log_n[] in bwase.c
 	pac = 0; bwt[0] = bwt[1] = 0;
 	for (i = 1; i != 256; ++i) g_log_n[i] = (int)(4.343 * log(i) + 0.5);
 	bns = bns_restore(prefix);
 	srand48(bns->seed);
-	fp_sa[0] = xopen(fn_sa[0], "r");
-	fp_sa[1] = xopen(fn_sa[1], "r");
+	for (i = 0; i < 2; ++i) {
+		fp_sa[i] = xopen(fn_sa[i], "r");
+		fread(&opt, sizeof(gap_opt_t), 1, fp_sa[i]);  // Overwritten on i==1
+		ks[i] = bwa_open_reads(opt.mode, fn_fa[i]);
+		if (i == 0) opt0 = opt;
+#ifdef HAVE_GOBY		
+		if (goby_config != NULL) {
+			// When opening the first file, the sequence will be read
+			// When opening the second file, the pair will be read
+			goby_config->which_sequence++;
+		}
+#endif
+	}
 	g_hash = kh_init(64);
 	last_ii.avg = -1.0;
 
-	fread(&opt, sizeof(gap_opt_t), 1, fp_sa[0]);
-	ks[0] = bwa_open_reads(opt.mode, fn_fa[0]);
-	opt0 = opt;
-	fread(&opt, sizeof(gap_opt_t), 1, fp_sa[1]); // overwritten!
-	ks[1] = bwa_open_reads(opt.mode, fn_fa[1]);
+#ifdef HAVE_GOBY
+    // Check that every input file is compact-reads or fasta/fastq, but not mixed.
+	if (goby_config->output_format == OUTPUT_FORMAT_GOBY) {
+		if ((goby_config->num_creads_files == goby_config->num_input_files) ||
+			(goby_config->num_creads_files == 0)) {
+			// All input is either compact-reads or fa/fq, which is fine.
+		} else {
+			fprintf(stderr, "ERROR: When the output format (-F) is set to 'goby' all input\n");
+			fprintf(stderr, "       files must be either fasta/fastq or compact-reads, but\n");
+			fprintf(stderr, "       fasta/fastq cannot be combined with compact-reads\n");
+			destroy(writerHelper, tot_seqs, bns, ntbns, ks, fp_sa, pac, bwt);
+			return;
+		}
+	}
+
+#endif
+
 	if (!(opt.mode & BWA_MODE_COMPREAD)) {
 		popt->type = BWA_PET_SOLID;
 		ntbns = bwa_open_nt(prefix);
@@ -689,9 +750,19 @@ void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const f
 		}
 	}
 
-	// core loop
+#ifdef HAVE_GOBY
+	if (goby_config->output_format == OUTPUT_FORMAT_GOBY) {
+		bwa_print_compact_SQ(writerHelper, bns);
+	} else {
+		bwa_print_sam_SQ(bns);
+		bwa_print_sam_PG();
+	}
+#else
 	bwa_print_sam_SQ(bns);
 	bwa_print_sam_PG();
+#endif
+
+	// core loop
 	while ((seqs[0] = bwa_read_seq(ks[0], 0x40000, &n_seqs, opt0.mode, opt0.trim_qual)) != 0) {
 		int cnt_chg;
 		isize_info_t ii;
@@ -715,8 +786,8 @@ void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const f
 			bwa_refine_gapped(bns, n_seqs, seqs[j], pacseq, ntbns);
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC); t = clock();
 		if (pac == 0) free(pacseq);
-
 		fprintf(stderr, "[bwa_sai2sam_pe_core] print alignments... ");
+        unsigned int ambiguity = 1;
 		for (i = 0; i < n_seqs; ++i) {
 			bwa_seq_t *p[2];
 			p[0] = seqs[0] + i; p[1] = seqs[1] + i;
@@ -724,8 +795,32 @@ void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const f
 				strcat(p[0]->bc, p[1]->bc);
 				strcpy(p[1]->bc, p[0]->bc);
 			}
+#ifdef HAVE_GOBY
+			if (goby_config->output_format == OUTPUT_FORMAT_GOBY) {
+                /**
+                 * Each query index will pass through here one time.
+                 * If the query index matches one place, p[x]->n_multi
+                 * have a value of 0, values >0 indicate ambiguity>1.
+                 * The -n parameter in bwase controls n_occ which controls
+                 * ambiguity, BUT, it isn't 100% yet clear to me how
+                 * sampe controls the same value, -n, -N, -o?
+                 */
+                unsigned int queryIndexOccurrences =
+                        gobyCountIndexOccurrences(bns, p[0], ambiguity) +
+                        gobyCountIndexOccurrences(bns, p[1], ambiguity);
+
+				bwa_print_compact1(writerHelper, bns, p[0], p[1],
+                                        opt.mode, queryIndexOccurrences, ambiguity);
+				bwa_print_compact1(writerHelper, bns, p[1], p[0],
+                                        opt.mode, queryIndexOccurrences, ambiguity);
+			} else {
+				bwa_print_sam1(bns, p[0], p[1], opt.mode, opt.max_top2);
+				bwa_print_sam1(bns, p[1], p[0], opt.mode, opt.max_top2);
+			}
+#else
 			bwa_print_sam1(bns, p[0], p[1], opt.mode, opt.max_top2);
 			bwa_print_sam1(bns, p[1], p[0], opt.mode, opt.max_top2);
+#endif
 		}
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC); t = clock();
 
@@ -736,18 +831,7 @@ void bwa_sai2sam_pe_core(const char *prefix, char *const fn_sa[2], char *const f
 	}
 
 	// destroy
-	bns_destroy(bns);
-	if (ntbns) bns_destroy(ntbns);
-	for (i = 0; i < 2; ++i) {
-		bwa_seq_close(ks[i]);
-		fclose(fp_sa[i]);
-	}
-	for (iter = kh_begin(g_hash); iter != kh_end(g_hash); ++iter)
-		if (kh_exist(g_hash, iter)) free(kh_val(g_hash, iter).a);
-	kh_destroy(64, g_hash);
-	if (pac) {
-		free(pac); bwt_destroy(bwt[0]); bwt_destroy(bwt[1]);
-	}
+	destroy(writerHelper, tot_seqs, bns, ntbns, ks, fp_sa, pac, bwt);
 }
 
 int bwa_sai2sam_pe(int argc, char *argv[])
@@ -757,7 +841,14 @@ int bwa_sai2sam_pe(int argc, char *argv[])
 	int c;
 	pe_opt_t *popt;
 	popt = bwa_init_pe_opt();
-	while ((c = getopt(argc, argv, "a:o:sPn:N:c:f:Ar:")) >= 0) {
+#ifdef HAVE_GOBY
+	goby_config_init();
+	char *configOptions = "a:o:sPn:N:c:f:Ar:x:y:F:";
+#else
+	char *configOptions = "a:o:sPn:N:c:f:Ar:";
+#endif
+	char *output_filename = NULL;
+	while ((c = getopt(argc, argv, configOptions)) >= 0) {
 		switch (c) {
 		case 'r':
 			if (bwa_set_rg(optarg) < 0) {
@@ -772,28 +863,88 @@ int bwa_sai2sam_pe(int argc, char *argv[])
 		case 'n': popt->n_multi = atoi(optarg); break;
 		case 'N': popt->N_multi = atoi(optarg); break;
 		case 'c': popt->ap_prior = atof(optarg); break;
-		case 'f': xreopen(optarg, "w", stdout); break;
+		case 'f': output_filename = strdup(optarg); break;
 		case 'A': popt->force_isize = 1; break;
-		default: return 1;
+#ifdef HAVE_GOBY
+		case 'F':
+			if (!strcmp(optarg, "sam")) {
+				goby_config->output_format = OUTPUT_FORMAT_SAM;
+			} else if (!strcmp(optarg, "goby")) {
+				goby_config->output_format = OUTPUT_FORMAT_GOBY;
+			} else {
+				fprintf(stderr, "-F output_format '%s' not recognized. Select 'sam' or 'goby'.\n", optarg);
+				return 1;
+			}
+			break;
+		case 'x': goby_config->input_start = strtoul(optarg,NULL,10); break;
+		case 'y': goby_config->input_end = strtoul(optarg,NULL,10); break;
+#endif
+		default: 
+			printf("Unrecognized option %c\n", c);
+			return 1;
 		}
 	}
 
+#ifdef HAVE_GOBY
+	if (output_filename) {
+		if (goby_config->output_format == OUTPUT_FORMAT_SAM) {
+			xreopen(output_filename, "w", stdout);
+		} else {
+			set_goby_config_output_basename(output_filename);
+		}
+		free(output_filename);
+		output_filename = NULL;
+	} else {
+		if (goby_config->output_format == OUTPUT_FORMAT_GOBY) {
+			fprintf(stderr, "-f output_basename is required if -F is set to 'goby'\n");
+			return 1;
+		}
+	}
+#else
+	if (output_filename) {
+		xreopen(output_filename, "w", stdout);
+		free(output_filename);
+		output_filename = NULL;
+	}
+#endif
+
 	if (optind + 5 > argc) {
-		fprintf(stderr, "\n");
-		fprintf(stderr, "Usage:   bwa sampe [options] <prefix> <in1.sai> <in2.sai> <in1.fq> <in2.fq>\n\n");
-		fprintf(stderr, "Options: -a INT   maximum insert size [%d]\n", popt->max_isize);
-		fprintf(stderr, "         -o INT   maximum occurrences for one end [%d]\n", popt->max_occ);
-		fprintf(stderr, "         -n INT   maximum hits to output for paired reads [%d]\n", popt->n_multi);
-		fprintf(stderr, "         -N INT   maximum hits to output for discordant pairs [%d]\n", popt->N_multi);
-		fprintf(stderr, "         -c FLOAT prior of chimeric rate (lower bound) [%.1le]\n", popt->ap_prior);
-        fprintf(stderr, "         -f FILE  sam file to output results to [stdout]\n");
+	        fprintf(stderr, "\n");
+	        fprintf(stderr, "Usage:   bwa sampe [options] <prefix> <in1.sai> <in2.sai> <in1.fq> <in2.fq>\n\n");
+        	fprintf(stderr, "Options: -a INT    maximum insert size [%d]\n", popt->max_isize);
+	        fprintf(stderr, "         -o INT    maximum occurrences for one end [%d]\n", popt->max_occ);
+        	fprintf(stderr, "         -n INT    maximum hits to output for paired reads [%d]\n", popt->n_multi);
+	        fprintf(stderr, "         -N INT    maximum hits to output for discordant pairs [%d]\n", popt->N_multi);
+        	fprintf(stderr, "         -c FLOAT  prior of chimeric rate (lower bound) [%.1le]\n", popt->ap_prior);
+        	fprintf(stderr, "         -f FILE  sam file to output results to [stdout]\n");
 		fprintf(stderr, "         -r STR   read group header line such as `@RG\\tID:foo\\tSM:bar' [null]\n");
-		fprintf(stderr, "         -P       preload index into memory (for base-space reads only)\n");
-		fprintf(stderr, "         -s       disable Smith-Waterman for the unmapped mate\n");
-		fprintf(stderr, "         -A       disable insert size estimate (force -s)\n\n");
+	        fprintf(stderr, "         -P        preload index into memory (for base-space reads only)\n");
+        	fprintf(stderr, "         -s        disable Smith-Waterman for the unmapped mate\n");
+	        fprintf(stderr, "         -A        disable insert size estimate (force -s)\n");
+#ifdef HAVE_GOBY
+		fprintf(stderr, "                   This is required if -F is set to 'goby'.\n");
+		fprintf(stderr, "         -F STR    output format 'sam' or 'goby' [sam].\n");
+		fprintf(stderr, "         -x INT    If reading from Goby compact-reads, the start\n");
+		fprintf(stderr, "                   position within the input file, which should be number of\n");
+		fprintf(stderr, "                   bytes into the file to start reading from. The read\n");
+		fprintf(stderr, "                   will actually start at the first record on or after\n");
+		fprintf(stderr, "                   this value. [0, start of file]\n");
+		fprintf(stderr, "         -y INT    If reading from Goby compact-reads, the end position\n");
+		fprintf(stderr, "                   within the input file, which should be number of bytes\n");
+		fprintf(stderr, "                   into the file to end reading from. The read will actually\n");
+		fprintf(stderr, "                   end at the end of the record on or after this\n");
+		fprintf(stderr, "                   value. [0, end of file]\n");
+#endif
+		fprintf(stderr, "\n");
 		fprintf(stderr, "Notes: 1. For SOLiD reads, <in1.fq> corresponds R3 reads and <in2.fq> to F3.\n");
 		fprintf(stderr, "       2. For reads shorter than 30bp, applying a smaller -o is recommended to\n");
 		fprintf(stderr, "          to get a sensible speed at the cost of pairing accuracy.\n");
+#ifdef HAVE_GOBY
+		fprintf(stderr, "       3. If <in1.fq> is Goby compact-reads, BWA will read the 'sequence'\n");
+		fprintf(stderr, "          from the <in1.fq>. If <in2.fq> is Goby compact-reads,'\n");
+		fprintf(stderr, "          BWA will read the 'pair' from <in2.fq>. If no 'pair' exists in'\n");
+		fprintf(stderr, "          <in2.fq> the 'sequence' will be read.'\n");
+#endif
 		fprintf(stderr, "\n");
 		return 1;
 	}

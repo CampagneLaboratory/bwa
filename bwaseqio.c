@@ -1,8 +1,17 @@
 #include <zlib.h>
 #include <ctype.h>
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
 #include "bwtaln.h"
 #include "utils.h"
 #include "bamlite.h"
+
+#ifdef HAVE_GOBY
+#include <goby/C_Reads.h> 	/* has gobyReads_..., goby_shutdownProtobuf,  */
+#include <goby/C_CompactHelpers.h>
+#endif
+#include "goby.h"
 
 #include "kseq.h"
 KSEQ_INIT(gzFile, gzread)
@@ -37,6 +46,9 @@ bwa_seqio_t *bwa_seq_open(const char *fn)
 	bwa_seqio_t *bs;
 	bs = (bwa_seqio_t*)calloc(1, sizeof(bwa_seqio_t));
 	fp = xzopen(fn, "r");
+	if (goby_config != NULL) {
+	    goby_config->input_filename = fn;
+	}
 	bs->ks = kseq_init(fp);
 	return bs;
 }
@@ -44,12 +56,28 @@ bwa_seqio_t *bwa_seq_open(const char *fn)
 void bwa_seq_close(bwa_seqio_t *bs)
 {
 	if (bs == 0) return;
-	if (bs->is_bam) bam_close(bs->fp);
-	else {
+	if (bs->is_bam) {
+		bam_close(bs->fp);
+        } else
+#ifdef HAVE_GOBY
+	if (bs->ks->f->is_creads) {
+		gobyReads_finished(bs->ks->f->creads_helper);
+		bs->ks->f->creads_helper = NULL;
+		bs->ks->f->is_creads = 0;
+		kseq_destroy(bs->ks);
+	} else
+#endif
+	if (bs->ks->f->f != NULL) {
 		gzclose(bs->ks->f->f);
+		bs->ks->f->f = NULL;
 		kseq_destroy(bs->ks);
 	}
 	free(bs);
+
+#ifdef HAVE_GOBY
+	free_goby_config();
+	goby_shutdownProtobuf();
+#endif
 }
 
 void seq_reverse(int len, ubyte_t *seq, int is_comp)

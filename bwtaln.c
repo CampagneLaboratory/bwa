@@ -11,6 +11,7 @@
 #include "bwtaln.h"
 #include "bwtgap.h"
 #include "utils.h"
+#include "goby.h"
 
 #ifdef HAVE_PTHREAD
 #define THREAD_BLOCK_SIZE 1024
@@ -79,7 +80,7 @@ static int bwt_cal_width(const bwt_t *rbwt, int len, const ubyte_t *str, bwt_wid
 
 void bwa_cal_sa_reg_gap(int tid, bwt_t *const bwt[2], int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt)
 {
-	int i, max_l = 0, max_len;
+	int i, max_l = -1, max_len;
 	gap_stack_t *stack;
 	bwt_width_t *w[2], *seed_w[2];
 	const ubyte_t *seq[2];
@@ -246,7 +247,14 @@ int bwa_aln(int argc, char *argv[])
 	gap_opt_t *opt;
 
 	opt = gap_init_opt();
-	while ((c = getopt(argc, argv, "n:o:e:i:d:l:k:cLR:m:t:NM:O:E:q:f:b012IB:")) >= 0) {
+#ifdef HAVE_GOBY
+	goby_config_init();
+	char *configOptions = "n:o:e:i:d:l:k:cLR:m:t:NM:O:E:q:f:b012IB:w:x:y:";
+#else
+	char *configOptions = "n:o:e:i:d:l:k:cLR:m:t:NM:O:E:q:f:b012IB:";
+                              
+#endif
+	while ((c = getopt(argc, argv, configOptions)) >= 0) {
 		switch (c) {
 		case 'n':
 			if (strstr(optarg, ".")) opt->fnr = atof(optarg), opt->max_diff = -1;
@@ -275,6 +283,11 @@ int bwa_aln(int argc, char *argv[])
 		case '2': opt->mode |= BWA_MODE_BAM_READ2; break;
 		case 'I': opt->mode |= BWA_MODE_IL13; break;
 		case 'B': opt->mode |= atoi(optarg) << 24; break;
+#ifdef HAVE_GOBY
+		case 'w': goby_config->which_sequence = atoi(optarg); break;
+		case 'x': goby_config->input_start = strtoul(optarg,NULL,10); break;
+		case 'y': goby_config->input_end = strtoul(optarg,NULL,10); break;
+#endif
 		default: return 1;
 		}
 	}
@@ -296,12 +309,20 @@ int bwa_aln(int argc, char *argv[])
 		fprintf(stderr, "         -k INT    maximum differences in the seed [%d]\n", opt->max_seed_diff);
 		fprintf(stderr, "         -m INT    maximum entries in the queue [%d]\n", opt->max_entries);
 		fprintf(stderr, "         -t INT    number of threads [%d]\n", opt->n_threads);
+#ifdef HAVE_GOBY
+		fprintf(stderr, "                   Warning: If you plan to write Goby Compact-Alignment files,\n");
+		fprintf(stderr, "                   running with a -t value greater than 1 and reading from\n");
+		fprintf(stderr, "                   fastq/fastq can cause the query_index in the alignment to be\n");
+		fprintf(stderr, "                   different than the read number in the input file. You\n");
+		fprintf(stderr, "                   can can solve this by converting your reads files to\n");
+		fprintf(stderr, "                   Goby compact-reads or run with -t 1\n");
+#endif
 		fprintf(stderr, "         -M INT    mismatch penalty [%d]\n", opt->s_mm);
 		fprintf(stderr, "         -O INT    gap open penalty [%d]\n", opt->s_gapo);
 		fprintf(stderr, "         -E INT    gap extension penalty [%d]\n", opt->s_gape);
 		fprintf(stderr, "         -R INT    stop searching when there are >INT equally best hits [%d]\n", opt->max_top2);
 		fprintf(stderr, "         -q INT    quality threshold for read trimming down to %dbp [%d]\n", BWA_MIN_RDLEN, opt->trim_qual);
-        fprintf(stderr, "         -f FILE   file to write output to instead of stdout\n");
+		fprintf(stderr, "         -f FILE   file to write output to instead of stdout\n");
 		fprintf(stderr, "         -B INT    length of barcode\n");
 		fprintf(stderr, "         -c        input sequences are in the color space\n");
 		fprintf(stderr, "         -L        log-scaled gap penalty for long deletions\n");
@@ -311,6 +332,21 @@ int bwa_aln(int argc, char *argv[])
 		fprintf(stderr, "         -0        use single-end reads only (effective with -b)\n");
 		fprintf(stderr, "         -1        use the 1st read in a pair (effective with -b)\n");
 		fprintf(stderr, "         -2        use the 2nd read in a pair (effective with -b)\n");
+#ifdef HAVE_GOBY
+		fprintf(stderr, "         -w INT    If reading from Goby compact-reads, specifies if the primary\n");
+		fprintf(stderr, "                   sequence should be read (0) or if the sequence pair\n");
+		fprintf(stderr, "                   should be read (1) [0]\n");
+		fprintf(stderr, "         -x INT    If reading from Goby compact-reads, the start\n");
+		fprintf(stderr, "                   position within the input file, which should be number of\n");
+		fprintf(stderr, "                   bytes into the file to start reading from. The read\n");
+		fprintf(stderr, "                   will actually start at the first record on or after\n");
+		fprintf(stderr, "                   this value. [0, start of file]\n");
+		fprintf(stderr, "         -y INT    If reading from Goby compact-reads, the end position\n");
+		fprintf(stderr, "                   within the input file, which should be number of bytes\n");
+		fprintf(stderr, "                   into the file to end reading from. The read will actually\n");
+		fprintf(stderr, "                   end at the end of the record on or after this\n");
+		fprintf(stderr, "                   value. [0, end of file]\n");
+#endif
 		fprintf(stderr, "\n");
 		return 1;
 	}

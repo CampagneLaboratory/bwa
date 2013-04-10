@@ -29,12 +29,22 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
+
+#ifdef HAVE_GOBY
+#include <goby/C_Reads.h> 	/* has gobyReads_..., goby_shutdownProtobuf,  */
+#include <goby/C_CompactHelpers.h>
+#endif
+#include "goby.h"
 
 #define __KS_TYPE(type_t)						\
 	typedef struct __kstream_t {				\
 		char *buf;								\
 		int begin, end, is_eof;					\
 		type_t f;								\
+		int is_creads;                          \
+		CReadsHelper *creads_helper;            \
+		int which_creads_sequence;              \
 	} kstream_t;
 
 #define ks_eof(ks) ((ks)->is_eof && (ks)->begin >= (ks)->end)
@@ -46,13 +56,16 @@
 		kstream_t *ks = (kstream_t*)calloc(1, sizeof(kstream_t));	\
 		ks->f = f;													\
 		ks->buf = (char*)malloc(__bufsize);							\
+		ks->is_creads = 0;                                          \
+		ks->which_creads_sequence = 0;                              \
+		ks->creads_helper = NULL;                                   \
 		return ks;													\
 	}																\
 	static inline void ks_destroy(kstream_t *ks)					\
 	{																\
-		if (ks) {													\
-			free(ks->buf);											\
-			free(ks);												\
+		if (ks) {                                                   \
+    	    free(ks->buf);				    						\
+	        free(ks);					  				            \
 		}															\
 	}
 
@@ -128,10 +141,11 @@ typedef struct __kstring_t {
 	__KS_GETUNTIL(__read, __bufsize)
 
 #define __KSEQ_BASIC(type_t)											\
-	static inline kseq_t *kseq_init(type_t fd)							\
+	static inline kseq_t *kseq_init(type_t fd)                    		\
 	{																	\
 		kseq_t *s = (kseq_t*)calloc(1, sizeof(kseq_t));					\
 		s->f = ks_init(fd);												\
+		__OPEN_GOBY_COMPACT                                             \
 		return s;														\
 	}																	\
 	static inline void kseq_rewind(kseq_t *ks)							\
@@ -153,8 +167,12 @@ typedef struct __kstring_t {
    -2   truncated quality string
  */
 #define __KSEQ_READ														\
+	__KSEQ_READ_GOBY                                                    \
 	static int kseq_read(kseq_t *seq)									\
 	{																	\
+		if (seq->f->is_creads) {                                        \
+			return kseq_read_compact(seq);                              \
+		}                                                               \
 		int c;															\
 		kstream_t *ks = seq->f;											\
 		if (seq->last_char == 0) { /* then jump to the next header line */ \
