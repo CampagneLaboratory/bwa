@@ -1,3 +1,5 @@
+This fork of BWA supports Goby. To compile BWA with Goby support, see installation instructions at http://campagnelab.org/software/goby/bwa/
+
 Released packages can be downloaded from SourceForge.net:
 
   http://sourceforge.net/projects/bio-bwa/files/
